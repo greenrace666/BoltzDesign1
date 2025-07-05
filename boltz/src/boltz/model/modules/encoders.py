@@ -2,14 +2,14 @@
 from functools import partial
 from math import pi
 
-from einops import rearrange
 import torch
+from einops import rearrange
 from torch import nn
 from torch.nn import Module, ModuleList
 from torch.nn.functional import one_hot
 
-from boltz.data import const
 import boltz.model.layers.initialize as init
+from boltz.data import const
 from boltz.model.layers.transition import Transition
 from boltz.model.modules.transformers import AtomTransformer
 from boltz.model.modules.utils import LinearNoBias
@@ -27,7 +27,6 @@ class FourierEmbedding(Module):
             The dimension of the embeddings.
 
         """
-
         super().__init__()
         self.proj = nn.Linear(1, dim)
         torch.nn.init.normal_(self.proj.weight, mean=0, std=1)
@@ -46,7 +45,7 @@ class FourierEmbedding(Module):
 class RelativePositionEncoder(Module):
     """Relative position encoder."""
 
-    def __init__(self, token_z, r_max=32, s_max=2, cyclic=False):
+    def __init__(self, token_z, r_max=32, s_max=2):
         """Initialize the relative position encoder.
 
         Parameters
@@ -62,7 +61,6 @@ class RelativePositionEncoder(Module):
         super().__init__()
         self.r_max = r_max
         self.s_max = s_max
-        self.cyclic = cyclic
         self.linear_layer = LinearNoBias(4 * (r_max + 1) + 2 * (s_max + 1) + 1, token_z)
 
     def forward(self, feats):
@@ -75,75 +73,27 @@ class RelativePositionEncoder(Module):
         b_same_entity = torch.eq(
             feats["entity_id"][:, :, None], feats["entity_id"][:, None, :]
         )
+        rel_pos = (
+            feats["residue_index"][:, :, None] - feats["residue_index"][:, None, :]
+        )
+        if torch.any(feats["cyclic_period"] != 0):
+            period = torch.where(
+                feats["cyclic_period"] > 0,
+                feats["cyclic_period"],
+                torch.zeros_like(feats["cyclic_period"]) + 10000,
+            ).unsqueeze(1)
+            rel_pos = (rel_pos - period * torch.round(rel_pos / period)).long()
 
         d_residue = torch.clip(
-            feats["residue_index"][:, :, None]
-            - feats["residue_index"][:, None, :]
-            + self.r_max,
+            rel_pos + self.r_max,
             0,
             2 * self.r_max,
         )
+
         d_residue = torch.where(
             b_same_chain, d_residue, torch.zeros_like(d_residue) + 2 * self.r_max + 1
         )
-
-        if self.cyclic:
-            def get_cyclic_offset(L):
-                '''Calculate cyclic offset matrix for length L
-                Args:
-                    L (int): Length of sequence
-                    offset_type (int): Type of offset calculation (1, 2, or 3)
-                Returns:
-                    torch.Tensor: LxL matrix of cyclic offsets
-                '''
-                i = torch.arange(L)
-                ij = torch.stack([i, i+L], -1)
-                offset = i[:,None] - i[None,:]
-                # Fix min() call by doing dimensions one at a time
-                c_offset = torch.abs(ij[:,None,:,None] - ij[None,:,None,:])
-                c_offset = c_offset.min(dim=2)[0]
-                c_offset = c_offset.min(dim=2)[0]
-                a = c_offset < torch.abs(offset)
-                c_offset[a] = -c_offset[a]
-                return c_offset * torch.sign(offset)
-
-            entity1_mask = feats['entity_id'][0] == 1
-            entity1_residues = feats['residue_index'][0][entity1_mask]
-            N = len(entity1_residues)
-            unique_residues = torch.unique(entity1_residues)
-            L = len(unique_residues)
-
-            cyclic_offset_unique = get_cyclic_offset(L).to(entity1_residues.device)
-            cyclic_offset_full = torch.zeros((N, N), device=entity1_residues.device)
-            position_to_group = {int(val): idx for idx, val in enumerate(unique_residues)}
-            group_indices = torch.tensor([position_to_group[int(pos)] for pos in entity1_residues], 
-                                    device=entity1_residues.device, dtype=torch.long)
-            idx_i = group_indices[:,None].expand(N,N)
-            idx_j = group_indices[None,:].expand(N,N)
-            cyclic_offset_full = cyclic_offset_unique[idx_i, idx_j]
-            cyclic_offset_full = (32 + cyclic_offset_full.to(torch.long))
-            padded_cyclic_offset = torch.zeros((feats['residue_index'].shape[1], feats['residue_index'].shape[1]), 
-                                            device=cyclic_offset_full.device, dtype=torch.long)
-            entity1_indices = torch.where(entity1_mask)[0]
-            padded_cyclic_offset[entity1_indices[:,None], entity1_indices] = cyclic_offset_full
-
-            a_rel_pos = one_hot(d_residue, 2 * self.r_max + 2)
-            X_a=torch.argmax(a_rel_pos[0],dim=-1)[:86, :86]
-            a_rel_pos_cyclic = one_hot(padded_cyclic_offset.unsqueeze(0), 2 * self.r_max + 2)
-            
-            chain_mask = (feats["entity_id"]==1)
-            chain_mask_2d = chain_mask.unsqueeze(1) & chain_mask.unsqueeze(2)
-            
-            a_rel_pos = torch.where(
-                chain_mask_2d.unsqueeze(-1),
-                a_rel_pos_cyclic,
-                a_rel_pos
-            )
-            X_b=torch.argmax(a_rel_pos[0],dim=-1)[:86, :86]
-            
-
-        else:
-            a_rel_pos = one_hot(d_residue, 2 * self.r_max + 2)
+        a_rel_pos = one_hot(d_residue, 2 * self.r_max + 2)
 
         d_token = torch.clip(
             feats["token_index"][:, :, None]

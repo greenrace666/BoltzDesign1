@@ -1,6 +1,6 @@
 import gc
 import random
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 import torch
 import torch._dynamo
@@ -36,7 +36,10 @@ from boltz.model.modules.trunk import (
 from boltz.model.modules.utils import ExponentialMovingAverage
 from boltz.model.optim.scheduler import AlphaFoldLRScheduler
 
+
 class Boltz1(LightningModule):
+    """Boltz1 model."""
+
     def __init__(  # noqa: PLR0915, C901, PLR0912
         self,
         atom_s: int,
@@ -72,7 +75,8 @@ class Boltz1(LightningModule):
         min_dist: float = 2.0,
         max_dist: float = 22.0,
         predict_args: Optional[dict[str, Any]] = None,
-        cyclic: bool = False,
+        steering_args: Optional[dict[str, Any]] = None,
+        use_kernels: bool = False,
     ) -> None:
         super().__init__()
 
@@ -115,6 +119,7 @@ class Boltz1(LightningModule):
                 self.plddt_mae[m] = MeanMetric()
         self.rmsd = MeanMetric()
         self.best_rmsd = MeanMetric()
+
         self.train_confidence_loss_logger = MeanMetric()
         self.train_confidence_loss_dict_logger = nn.ModuleDict()
         for m in [
@@ -133,6 +138,9 @@ class Boltz1(LightningModule):
         self.validation_args = validation_args
         self.diffusion_loss_args = diffusion_loss_args
         self.predict_args = predict_args
+        self.steering_args = steering_args
+
+        self.use_kernels = use_kernels
 
         self.nucleotide_rmsd_weight = nucleotide_rmsd_weight
         self.ligand_rmsd_weight = ligand_rmsd_weight
@@ -149,7 +157,6 @@ class Boltz1(LightningModule):
         self.s_init = nn.Linear(s_input_dim, token_s, bias=False)
         self.z_init_1 = nn.Linear(s_input_dim, token_z, bias=False)
         self.z_init_2 = nn.Linear(s_input_dim, token_z, bias=False)
-        self.cyclic = cyclic
 
         # Input embeddings
         full_embedder_args = {
@@ -164,11 +171,13 @@ class Boltz1(LightningModule):
             **embedder_args,
         }
         self.input_embedder = InputEmbedder(**full_embedder_args)
-        self.rel_pos = RelativePositionEncoder(token_z, cyclic=self.cyclic)
+        self.rel_pos = RelativePositionEncoder(token_z)
         self.token_bonds = nn.Linear(1, token_z, bias=False)
+
+        # Normalization layers
         self.s_norm = nn.LayerNorm(token_s)
         self.z_norm = nn.LayerNorm(token_z)
-        
+
         # Recycling projections
         self.s_recycle = nn.Linear(token_s, token_s, bias=False)
         self.z_recycle = nn.Linear(token_z, token_z, bias=False)
@@ -194,10 +203,13 @@ class Boltz1(LightningModule):
                 dynamic=False,
                 fullgraph=False,
             )
-        # Output modules
 
-    
-        use_accumulate_token_repr = confidence_prediction and "use_s_diffusion" in confidence_model_args and confidence_model_args["use_s_diffusion"]
+        # Output modules
+        use_accumulate_token_repr = (
+            confidence_prediction
+            and "use_s_diffusion" in confidence_model_args
+            and confidence_model_args["use_s_diffusion"]
+        )
         self.structure_module = AtomDiffusion(
             score_model_args={
                 "token_z": token_z,
@@ -229,7 +241,6 @@ class Boltz1(LightningModule):
                     pairformer_args=pairformer_args,
                     full_embedder_args=full_embedder_args,
                     msa_args=msa_args,
-                    cyclic=self.cyclic,
                     **confidence_model_args,
                 )
             else:
@@ -244,187 +255,19 @@ class Boltz1(LightningModule):
                     self.confidence_module, dynamic=False, fullgraph=False
                 )
 
-
-
+        # Remove grad from weights they are not trained for ddp
         if not structure_prediction_training:
             for name, param in self.named_parameters():
                 if name.split(".")[0] != "confidence_module":
                     param.requires_grad = False
 
-
-    def get_distogram(
-        self,
-        feats: dict[str, Tensor],
-    ) -> dict[str, Tensor]:
-        dict_out = {}
-
-
-        with torch.set_grad_enabled(True):
-            s_inputs = self.input_embedder(feats)
-            # Initialize the sequence and pairwise embeddings
-            s_init = self.s_init(s_inputs)
-            z_init = (
-                self.z_init_1(s_inputs)[:, :, None]
-                + self.z_init_2(s_inputs)[:, None, :]
-            )
-            relative_position_encoding = self.rel_pos(feats)
-            z_init = z_init + relative_position_encoding
-            z_init = z_init + self.token_bonds(feats["token_bonds"].float())
-
-            # Perform rounds of the pairwise stack
-            s = torch.zeros_like(s_init)
-            z = torch.zeros_like(z_init)
-
-            # Compute pairwise mask
-            mask = feats["token_pad_mask"].float()
-            pair_mask = mask[:, :, None] * mask[:, None, :]
-            
-            for i in range(self.predict_args["recycling_steps"] + 1):
-                with torch.set_grad_enabled(True):
-                    # Fixes an issue with unused parameters in autocast
-                    if (
-                        self.training
-                        and (i == self.predict_args["recycling_steps"])
-                        and torch.is_autocast_enabled()
-                    ):
-                        torch.clear_autocast_cache()
-
-                    # Apply recycling
-                    s = s_init + self.s_recycle(self.s_norm(s))
-                    z = z_init + self.z_recycle(self.z_norm(z))
-
-                    # Compute pairwise stack
-                    if not self.no_msa:
-                        z = z + self.msa_module(z, s_inputs, feats)
-
-                    # Revert to uncompiled version for validation
-                    if self.is_pairformer_compiled and not self.training:
-                        pairformer_module = self.pairformer_module._orig_mod  # noqa: SLF001
-                    else:
-                        pairformer_module = self.pairformer_module
-
-                    s, z = pairformer_module(s, z, mask=mask, pair_mask=pair_mask)
-
-            pdistogram = self.distogram_module(z)
-            dict_out = {"pdistogram": pdistogram}
-
-        return dict_out, s, z, s_inputs
-
-    def get_distogram_confidence(
-        self,
-        feats: dict[str, Tensor],
-        recycling_steps: int = 0,
-        num_sampling_steps: Optional[int] = None,
-        multiplicity_diffusion_train: int = 1,
-        diffusion_samples: int = 1,
-        run_confidence_sequentially: bool = False,
-        disconnect_feats: bool = False,
-        disconnect_pairformer: bool = False,
-    ) -> dict[str, Tensor]:
-        dict_out = {}
-
-        # Compute input embeddings
-        with torch.set_grad_enabled(True): 
-            s_inputs = self.input_embedder(feats)
-
-            # Initialize the sequence and pairwise embeddings
-            s_init = self.s_init(s_inputs)
-            z_init = (
-                self.z_init_1(s_inputs)[:, :, None]
-                + self.z_init_2(s_inputs)[:, None, :]
-            )
-            relative_position_encoding = self.rel_pos(feats)
-            z_init = z_init + relative_position_encoding
-            z_init = z_init + self.token_bonds(feats["token_bonds"].float())
-
-            # Perform rounds of the pairwise stack
-            s = torch.zeros_like(s_init)
-            z = torch.zeros_like(z_init)
-
-            # Compute pairwise mask
-            mask = feats["token_pad_mask"].float()
-            pair_mask = mask[:, :, None] * mask[:, None, :]
-
-            for i in range(recycling_steps + 1):
-                with torch.set_grad_enabled(True):
-                    torch.clear_autocast_cache()
-                    # Apply recycling
-                    s = s_init + self.s_recycle(self.s_norm(s))
-                    z = z_init + self.z_recycle(self.z_norm(z))
-
-                    # Compute pairwise stack
-                    if not self.no_msa:
-                        z = z + self.msa_module(z, s_inputs, feats)
-
-                    # Revert to uncompiled version for validation
-                    if self.is_pairformer_compiled and not self.training:
-                        pairformer_module = self.pairformer_module._orig_mod  # noqa: SLF001
-                    else:
-                        pairformer_module = self.pairformer_module
-
-                    s, z = pairformer_module(s, z, mask=mask, pair_mask=pair_mask)
-
-            pdistogram = self.distogram_module(z)
-            dict_out = {"pdistogram": pdistogram}
-
-    
-        structure_out = self.structure_module.sample(
-            s_trunk=s,
-            z_trunk=z,
-            s_inputs=s_inputs,
-            feats=feats,
-            relative_position_encoding=relative_position_encoding,
-            num_sampling_steps=num_sampling_steps,
-            atom_mask=feats["atom_pad_mask"],
-            multiplicity=diffusion_samples,
-            train_accumulate_token_repr=self.training,
-        )
-        # Detach structure outputs but not the inputs
-        dict_out.update({
-            k: v.detach() if isinstance(v, torch.Tensor) else v 
-            for k, v in structure_out.items()
-        })
-
-        if disconnect_feats:
-            feats_ = {k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in feats.items()}
-        else:
-            feats_ = feats
-
-        if disconnect_pairformer:
-            s_inputs = s_inputs.detach()
-            s = s.detach()
-            z = z.detach()
-            dict_out_pdistogram = dict_out["pdistogram"].detach()
-
-        else:
-            s_inputs = s_inputs
-            s = s
-            z = z
-            dict_out_pdistogram = dict_out["pdistogram"]
-
-        if self.confidence_prediction:
-            dict_out.update(
-                self.confidence_module(
-                    s_inputs=s_inputs,  # Allow gradients
-                    s=s,  # Allow gradients
-                    z=z,  # Allow gradients
-                    s_diffusion=(
-                        dict_out["diff_token_repr"]
-                        if self.confidence_module.use_s_diffusion
-                        else None
-                    ),
-                    x_pred=dict_out["sample_atom_coords"],  # Already detached above
-                    feats=feats_,
-                    pred_distogram_logits=dict_out_pdistogram,
-                    multiplicity=diffusion_samples,
-                    run_sequentially=run_confidence_sequentially,
-                )
-            )
-            
-        if self.confidence_prediction and self.confidence_module.use_s_diffusion:
-            dict_out.pop("diff_token_repr", None)
-            
-        return dict_out
+    def setup(self, stage: str) -> None:
+        """Set the model for training, validation and inference."""
+        if stage == "predict" and not (
+            torch.cuda.is_available()
+            and torch.cuda.get_device_properties(torch.device("cuda")).major >= 8.0  # noqa: PLR2004
+        ):
+            self.use_kernels = False
 
     def forward(
         self,
@@ -433,6 +276,7 @@ class Boltz1(LightningModule):
         num_sampling_steps: Optional[int] = None,
         multiplicity_diffusion_train: int = 1,
         diffusion_samples: int = 1,
+        max_parallel_samples: Optional[int] = None,
         run_confidence_sequentially: bool = False,
     ) -> dict[str, Tensor]:
         dict_out = {}
@@ -441,8 +285,6 @@ class Boltz1(LightningModule):
         with torch.set_grad_enabled(
             self.training and self.structure_prediction_training
         ):
-            
-        
             s_inputs = self.input_embedder(feats)
 
             # Initialize the sequence and pairwise embeddings
@@ -479,7 +321,9 @@ class Boltz1(LightningModule):
 
                     # Compute pairwise stack
                     if not self.no_msa:
-                        z = z + self.msa_module(z, s_inputs, feats)
+                        z = z + self.msa_module(
+                            z, s_inputs, feats, use_kernels=self.use_kernels
+                        )
 
                     # Revert to uncompiled version for validation
                     if self.is_pairformer_compiled and not self.training:
@@ -487,7 +331,13 @@ class Boltz1(LightningModule):
                     else:
                         pairformer_module = self.pairformer_module
 
-                    s, z = pairformer_module(s, z, mask=mask, pair_mask=pair_mask)
+                    s, z = pairformer_module(
+                        s,
+                        z,
+                        mask=mask,
+                        pair_mask=pair_mask,
+                        use_kernels=self.use_kernels,
+                    )
 
             pdistogram = self.distogram_module(z)
             dict_out = {"pdistogram": pdistogram}
@@ -516,10 +366,12 @@ class Boltz1(LightningModule):
                     num_sampling_steps=num_sampling_steps,
                     atom_mask=feats["atom_pad_mask"],
                     multiplicity=diffusion_samples,
+                    max_parallel_samples=max_parallel_samples,
                     train_accumulate_token_repr=self.training,
+                    steering_args=self.steering_args,
                 )
             )
-        # print("running confidence module")
+
         if self.confidence_prediction:
             dict_out.update(
                 self.confidence_module(
@@ -536,13 +388,12 @@ class Boltz1(LightningModule):
                     pred_distogram_logits=dict_out["pdistogram"].detach(),
                     multiplicity=diffusion_samples,
                     run_sequentially=run_confidence_sequentially,
+                    use_kernels=self.use_kernels,
                 )
             )
         if self.confidence_prediction and self.confidence_module.use_s_diffusion:
             dict_out.pop("diff_token_repr", None)
-
         return dict_out
-
 
     def get_true_coordinates(
         self,
@@ -1302,6 +1153,7 @@ class Boltz1(LightningModule):
                 recycling_steps=self.predict_args["recycling_steps"],
                 num_sampling_steps=self.predict_args["sampling_steps"],
                 diffusion_samples=self.predict_args["diffusion_samples"],
+                max_parallel_samples=self.predict_args["diffusion_samples"],
                 run_confidence_sequentially=True,
             )
             pred_dict = {"exception": False}
@@ -1309,8 +1161,14 @@ class Boltz1(LightningModule):
             pred_dict["coords"] = out["sample_atom_coords"]
             if self.predict_args.get("write_confidence_summary", True):
                 pred_dict["confidence_score"] = (
-                    4 * out["complex_plddt"] +
-                    (out["iptm"] if not torch.allclose(out["iptm"], torch.zeros_like(out["iptm"])) else out["ptm"])
+                    4 * out["complex_plddt"]
+                    + (
+                        out["iptm"]
+                        if not torch.allclose(
+                            out["iptm"], torch.zeros_like(out["iptm"])
+                        )
+                        else out["ptm"]
+                    )
                 ) / 5
                 for key in [
                     "ptm",
@@ -1338,7 +1196,7 @@ class Boltz1(LightningModule):
                 gc.collect()
                 return {"exception": True}
             else:
-                raise {"exception": True}
+                raise
 
     def configure_optimizers(self):
         """Configure the optimizer."""
@@ -1348,6 +1206,10 @@ class Boltz1(LightningModule):
         else:
             parameters = [
                 p for p in self.confidence_module.parameters() if p.requires_grad
+            ] + [
+                p
+                for p in self.structure_module.out_token_feat_update.parameters()
+                if p.requires_grad
             ]
 
         optimizer = torch.optim.Adam(
@@ -1383,7 +1245,9 @@ class Boltz1(LightningModule):
                 self.ema.load_state_dict(checkpoint["ema"], device=torch.device("cpu"))
             else:
                 self.ema = None
-                print("Warning: EMA state not loaded due to incompatible model parameters.")
+                print(
+                    "Warning: EMA state not loaded due to incompatible model parameters."
+                )
 
     def on_train_start(self):
         if self.use_ema and self.ema is None:

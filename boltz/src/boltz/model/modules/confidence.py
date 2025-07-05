@@ -1,9 +1,9 @@
 import torch
-from torch import nn
 import torch.nn.functional as F
+from torch import nn
 
-from boltz.data import const
 import boltz.model.layers.initialize as init
+from boltz.data import const
 from boltz.model.modules.confidence_utils import (
     compute_aggregated_metric,
     compute_ptms,
@@ -15,6 +15,7 @@ from boltz.model.modules.trunk import (
     PairformerModule,
 )
 from boltz.model.modules.utils import LinearNoBias
+
 
 class ConfidenceModule(nn.Module):
     """Confidence module."""
@@ -36,7 +37,6 @@ class ConfidenceModule(nn.Module):
         full_embedder_args: dict = None,
         msa_args: dict = None,
         compile_pairformer=False,
-        cyclic=False,
     ):
         """Initialize the confidence module.
 
@@ -76,7 +76,6 @@ class ConfidenceModule(nn.Module):
         """
         super().__init__()
         self.max_num_atoms_per_token = 23
-        self.cyclic = cyclic
         self.no_update_s = pairformer_args.get("no_update_s", False)
         boundaries = torch.linspace(2, max_dist, num_dist_bins - 1)
         self.register_buffer("boundaries", boundaries)
@@ -115,7 +114,7 @@ class ConfidenceModule(nn.Module):
 
             # Input embeddings
             self.input_embedder = InputEmbedder(**full_embedder_args)
-            self.rel_pos = RelativePositionEncoder(token_z, cyclic=self.cyclic)
+            self.rel_pos = RelativePositionEncoder(token_z)
             self.token_bonds = nn.Linear(1, token_z, bias=False)
 
             # Normalization layers
@@ -165,7 +164,7 @@ class ConfidenceModule(nn.Module):
 
             self.add_z_input_to_z = add_z_input_to_z
             if add_z_input_to_z:
-                self.rel_pos = RelativePositionEncoder(token_z, cyclic=self.cyclic)
+                self.rel_pos = RelativePositionEncoder(token_z)
                 self.token_bonds = nn.Linear(1, token_z, bias=False)
 
             self.pairformer_stack = PairformerModule(
@@ -192,6 +191,7 @@ class ConfidenceModule(nn.Module):
         multiplicity=1,
         s_diffusion=None,
         run_sequentially=False,
+        use_kernels: bool = False,
     ):
         if run_sequentially and multiplicity > 1:
             assert z.shape[0] == 1, "Not supported with batch size > 1"
@@ -210,6 +210,7 @@ class ConfidenceModule(nn.Module):
                         if s_diffusion is not None
                         else None,
                         run_sequentially=False,
+                        use_kernels=use_kernels,
                     )
                 )
 
@@ -230,7 +231,6 @@ class ConfidenceModule(nn.Module):
                     out_dict[key] = pair_chains_iptm
             return out_dict
         if self.imitate_trunk:
-            
             s_inputs = self.input_embedder(feats)
 
             # Initialize the sequence and pairwise embeddings
@@ -239,7 +239,6 @@ class ConfidenceModule(nn.Module):
                 self.z_init_1(s_inputs)[:, :, None]
                 + self.z_init_2(s_inputs)[:, None, :]
             )
-
             relative_position_encoding = self.rel_pos(feats)
             z_init = z_init + relative_position_encoding
             z_init = z_init + self.token_bonds(feats["token_bonds"].float())
@@ -249,7 +248,6 @@ class ConfidenceModule(nn.Module):
             z = z_init + self.z_recycle(self.z_norm(z))
 
         else:
-            
             s_inputs = self.s_inputs_norm(s_inputs).repeat_interleave(multiplicity, 0)
             if not self.no_update_s:
                 s = self.s_norm(s)
@@ -292,24 +290,28 @@ class ConfidenceModule(nn.Module):
         x_pred_repr = torch.bmm(token_to_rep_atom.float(), x_pred)
         d = torch.cdist(x_pred_repr, x_pred_repr)
 
-        distogram_ = (d.unsqueeze(-1) > self.boundaries).sum(dim=-1).long()
-        distogram = self.dist_bin_pairwise_embed(distogram_)
-        z = z + distogram
+        distogram = (d.unsqueeze(-1) > self.boundaries).sum(dim=-1).long()
+        distogram = self.dist_bin_pairwise_embed(distogram)
 
+        z = z + distogram
 
         mask = feats["token_pad_mask"].repeat_interleave(multiplicity, 0)
         pair_mask = mask[:, :, None] * mask[:, None, :]
 
         if self.imitate_trunk:
-            z = z + self.msa_module(z, s_inputs, feats)
+            z = z + self.msa_module(z, s_inputs, feats, use_kernels=use_kernels)
 
-            # s, z = self.pairformer_module(s, z, mask=mask, pair_mask=pair_mask)
-            s_, z_ = self.pairformer_module(s, z, mask=mask, pair_mask=pair_mask)
+            s, z = self.pairformer_module(
+                s, z, mask=mask, pair_mask=pair_mask, use_kernels=use_kernels
+            )
 
-            s, z = self.final_s_norm(s_), self.final_z_norm(z_)
+            s, z = self.final_s_norm(s), self.final_z_norm(z)
 
         else:
-            s_t, z_t = self.pairformer_stack(s, z, mask=mask, pair_mask=pair_mask)
+            s_t, z_t = self.pairformer_stack(
+                s, z, mask=mask, pair_mask=pair_mask, use_kernels=use_kernels
+            )
+
             # AF3 has residual connections, we remove them
             s = s_t
             z = z_t
@@ -360,8 +362,8 @@ class ConfidenceHeads(nn.Module):
             The number of pae bins, by default 64.
         compute_pae : bool
             Whether to compute pae, by default False
-        """
 
+        """
         super().__init__()
         self.max_num_atoms_per_token = 23
         self.to_pde_logits = LinearNoBias(token_z, num_pde_bins)
